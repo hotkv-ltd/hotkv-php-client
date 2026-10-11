@@ -1,0 +1,147 @@
+name: Publish
+
+# Releasing a Composer package works differently from npm or PyPI: Packagist
+# does not receive an upload. It watches the GitHub repository (through the
+# webhook that Packagist installs when the package is submitted, or through
+# its GitHub app) and builds a new version whenever a "vX.Y.Z" tag is
+# pushed. So this workflow does not publish anything to Packagist. It:
+#
+#   1. checks that the version is a semantic version taken from the tag
+#      (and that composer.json does not pin a different "version");
+#   2. validates composer.json, installs, lints and runs the unit tests;
+#   3. builds the distributable archive;
+#   4. creates the GitHub release with generated release notes.
+#
+# Steps 1 to 3 always run. Step 4 runs for a pushed tag, and for a manual run
+# only when "dry_run" is switched off (and then the tag must already exist).
+# See "Releasing" in README.md for the one-time Packagist setup.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Verify only: do not create a GitHub release'
+        type: boolean
+        default: true
+      version:
+        description: 'Version to verify or release, without the leading v (a dry run without it uses 0.0.0-dev)'
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine and check the version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "push" ]; then
+            version="${REF_NAME#v}"
+          elif [ -n "${INPUT_VERSION:-}" ]; then
+            version="${INPUT_VERSION#v}"
+          elif [ "${DRY_RUN:-true}" = "true" ]; then
+            version="0.0.0-dev"
+          else
+            echo "::error::a manual release needs the version input (the tag must already exist)"
+            exit 1
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'$version' is not a semantic version (X.Y.Z)"
+            exit 1
+          fi
+          # Packagist takes the version from the tag. A "version" key in
+          # composer.json is discouraged and must never disagree with it.
+          pinned="$(php -r '$j = json_decode(file_get_contents("composer.json"), true); echo $j["version"] ?? "";')"
+          if [ -n "$pinned" ] && [ "$pinned" != "$version" ]; then
+            echo "::error::composer.json pins version $pinned but the release is $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing version $version"
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          coverage: none
+
+      - name: Validate composer.json
+        run: composer validate --strict
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress
+
+      - name: Lint (php -l)
+        run: composer run-script lint
+
+      - name: Unit tests (no server needed)
+        run: vendor/bin/phpunit --testsuite unit
+
+      - name: Build distributable archive
+        run: composer archive --format=zip --dir=dist --file="hotkv-php-${{ steps.version.outputs.version }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: dist/
+
+  release:
+    name: Create GitHub release
+    needs: verify
+    # A pushed tag always releases. A manual run releases only when dry_run is off.
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          # Never creates a tag: a manual run needs the tag to exist already.
+          if ! git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
+            echo "::error::tag $tag does not exist; push it first (Packagist builds the version from the tag)"
+            exit 1
+          fi
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "Release $tag already exists, nothing to do."
+            exit 0
+          fi
+          prerelease=""
+          case "$VERSION" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$tag" "dist/hotkv-php-$VERSION.zip" \
+            --title "HotKV PHP SDK $VERSION" \
+            --generate-notes \
+            --verify-tag $prerelease
